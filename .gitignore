@@ -1,0 +1,6 @@
+/target
+/gen/schemas
+nfa.exe
+*.pdb
+Thumbs.db
+.DS_Store
