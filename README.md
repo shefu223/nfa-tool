@@ -1,5 +1,7 @@
 # NFA Loader
 
+<img width="477" height="840" alt="image" src="https://github.com/user-attachments/assets/7d60daf8-5f70-4c99-8e3f-1a34bcb19db7" />
+
 A lightweight Windows loader for switching between Steam accounts using login tokens. It is built for [shefu223.shop](https://shefu223.shop), but it will work with any valid Steam login token.
 
 Paste a token, hit Add, and the loader writes the account straight into Steam's config so you can log in with one click. No passwords, no Steam Guard prompts, just the token.
