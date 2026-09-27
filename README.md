@@ -24,3 +24,11 @@ This produces a self-contained `nfa.exe` (static C runtime) and scrubs local bui
 - `icons/`, `assets/` app icons and brand art
 - `tauri.conf.json`, `capabilities/` Tauri window and permission config
 - `build.ps1` release build with path and username scrubbing
+
+## Changelog
+
+### shefu223.shop NFA Loader
+- Redesigned interface with account cards, search, and live status
+- Account checks run locally: token valid or invalid, CS2 Premier and Wingman rank, cooldown, and with an API key VAC and Steam level. No proxies
+- View token, per account details, and a warranty timer
+- Fixed the intermittent blank Steam login
