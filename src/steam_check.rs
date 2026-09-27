@@ -1,8 +1,10 @@
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::OnceLock;
 use std::time::Duration;
+use steam_vent::auth::RefreshToken;
 use steam_vent::{Connection, ConnectionError, ConnectionTrait, EResult, LoginError, ServerList};
 use steam_vent_proto::steammessages_auth_steamclient::CAuthentication_AccessToken_GenerateForApp_Request;
 
@@ -38,9 +40,9 @@ pub async fn server_list(cell: &ServerListCell) -> Option<&ServerList> {
 
 fn is_dead_error(err: &ConnectionError) -> bool {
     match err {
-        ConnectionError::AccessToken(_) => true,
         ConnectionError::LoginError(le) => match le {
-            LoginError::InvalidCredentials
+            LoginError::AccessToken(_)
+            | LoginError::InvalidCredentials
             | LoginError::UnavailableAccount
             | LoginError::InvalidSteamId => true,
             LoginError::Unknown(er) => matches!(
@@ -75,35 +77,82 @@ async fn mint_access_token(conn: &Connection, raw_token: &str, steamid: u64) -> 
     resp.access_token.filter(|s| !s.is_empty())
 }
 
-pub async fn deep_check(server_list: &ServerList, account: &str, raw_token: &str) -> DeepOutcome {
-    match Connection::access(server_list, account, raw_token).await {
-        Ok(conn) => {
-            let steamid: u64 = conn.steam_id().into();
-            let access = mint_access_token(&conn, raw_token, steamid).await;
-            drop(conn);
-            let data = match access {
-                Some(a) => tokio::task::spawn_blocking(move || scrape_gcpd(steamid, &a))
-                    .await
-                    .ok()
-                    .flatten(),
-                None => None,
+pub async fn deep_check(server_list: &ServerList, raw_token: &str) -> DeepOutcome {
+    let token = match RefreshToken::new(raw_token.to_string()) {
+        Ok(t) => t,
+        Err(_) => {
+            debug_log("token is not a valid Steam login token");
+            return DeepOutcome {
+                liveness: Liveness::Invalid,
+                data: None,
+                steamid: None,
             };
-            DeepOutcome {
-                liveness: Liveness::Valid,
-                data,
-                steamid: Some(steamid),
+        }
+    };
+    let mut last = String::new();
+    for attempt in 1..=4 {
+        match Connection::login_with_refresh_token(server_list, &token).await {
+            Ok(conn) => {
+                let steamid: u64 = conn.steam_id().into();
+                let access = mint_access_token(&conn, raw_token, steamid).await;
+                drop(conn);
+                let data = match access {
+                    Some(a) => tokio::task::spawn_blocking(move || scrape_gcpd(steamid, &a))
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                };
+                debug_log(&format!(
+                    "attempt {attempt} login ok sid={steamid} rank_found={}",
+                    data.is_some()
+                ));
+                return DeepOutcome {
+                    liveness: Liveness::Valid,
+                    data,
+                    steamid: Some(steamid),
+                };
+            }
+            Err(err) => {
+                let dead = is_dead_error(&err);
+                debug_log(&format!("attempt {attempt} err dead={dead}: {err:#}"));
+                if dead {
+                    return DeepOutcome {
+                        liveness: Liveness::Invalid,
+                        data: None,
+                        steamid: None,
+                    };
+                }
+                last = format!("{err:#}");
             }
         }
-        Err(err) => DeepOutcome {
-            liveness: if is_dead_error(&err) {
-                Liveness::Invalid
-            } else {
-                Liveness::Unknown
-            },
-            data: None,
-            steamid: None,
-        },
     }
+    debug_log(&format!("gave up after 4 attempts: {last}"));
+    DeepOutcome {
+        liveness: Liveness::Unknown,
+        data: None,
+        steamid: None,
+    }
+}
+
+fn debug_log(msg: &str) {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return;
+    };
+    let dir = std::path::Path::new(&appdata).join("shefu223-nfa");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("check.log"))
+    else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(f, "{ts} {msg}");
 }
 
 fn scrape_gcpd(steamid: u64, access_token: &str) -> Option<DeepData> {

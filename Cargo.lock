@@ -3687,6 +3687,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3854,10 +3860,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "steam-vent"
-version = "0.5.0"
+name = "steam-machine-id"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9d416a5598309a8e526c4a5cc24ee1eaed712390f4a96ecc48db019a6ce1300"
+checksum = "84106c8799697ba98cb133172dbebc453dc7949a0e9ea02801490601c362d406"
+dependencies = [
+ "bytes",
+ "rand 0.9.5",
+ "sha1_smol",
+]
+
+[[package]]
+name = "steam-vent"
+version = "0.6.0"
+source = "git+https://codeberg.org/steam-vent/steam-vent.git?rev=b0e40109dd7a1b5101e1546ed27f62663dbe5c4b#b0e40109dd7a1b5101e1546ed27f62663dbe5c4b"
 dependencies = [
  "another-steam-totp",
  "async-stream",
@@ -3874,13 +3890,15 @@ dependencies = [
  "num-bigint-dig",
  "num-traits",
  "num_enum",
- "protobuf",
  "rand 0.10.3",
  "reqwest 0.13.4",
  "rsa",
  "rustls",
  "serde",
  "serde_json",
+ "serde_with",
+ "steam-machine-id",
+ "steam-vent-core",
  "steam-vent-crypto",
  "steam-vent-proto-common",
  "steam-vent-proto-steam",
@@ -3895,10 +3913,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "steam-vent-core"
+version = "0.1.0"
+source = "git+https://codeberg.org/steam-vent/steam-vent.git?rev=b0e40109dd7a1b5101e1546ed27f62663dbe5c4b#b0e40109dd7a1b5101e1546ed27f62663dbe5c4b"
+dependencies = [
+ "bytes",
+ "steam-vent-proto-common",
+ "thiserror 2.0.18",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "steam-vent-crypto"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c37c08a0e9fa3fbc85a3359a02cf82700e39810a01e707aeaa1869915def112d"
+source = "git+https://codeberg.org/steam-vent/steam-vent.git?rev=b0e40109dd7a1b5101e1546ed27f62663dbe5c4b#b0e40109dd7a1b5101e1546ed27f62663dbe5c4b"
 dependencies = [
  "aes",
  "bytes",
@@ -3908,7 +3937,7 @@ dependencies = [
  "rand 0.8.8",
  "rsa",
  "sha-1",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -349,13 +349,13 @@ async fn public_check(steamid: String, state: State<'_, AppData>) -> Result<Snap
 
 #[tauri::command]
 async fn deep_check(steamid: String, state: State<'_, AppData>) -> Result<Snapshot, String> {
-    let (username, token) = {
+    let token = {
         let accounts = state.accounts.lock().unwrap();
-        let acc = accounts
+        accounts
             .iter()
             .find(|a| a.steamid == steamid)
-            .ok_or("Account not found.")?;
-        (acc.username.clone(), acc.token.clone())
+            .map(|a| a.token.clone())
+            .ok_or("Account not found.")?
     };
 
     let _permit = state
@@ -366,7 +366,7 @@ async fn deep_check(steamid: String, state: State<'_, AppData>) -> Result<Snapsh
     let server_list = steam_check::server_list(&state.server_list)
         .await
         .ok_or("Can't check right now. Check your internet and try again.")?;
-    let outcome = steam_check::deep_check(server_list, &username, &token).await;
+    let outcome = steam_check::deep_check(server_list, &token).await;
 
     let mut snaps = state.snapshots.lock().unwrap();
     let snap = snaps.entry(steamid.clone()).or_default();

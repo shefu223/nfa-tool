@@ -19,7 +19,7 @@ base64 = "0.22"
 crc32fast = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
 # Local, non-destructive Steam checks (token validity + CS2 rank scrape). No proxies, no shop API.
-steam-vent = "0.5"
+steam-vent = { git = "https://codeberg.org/steam-vent/steam-vent.git", rev = "b0e40109dd7a1b5101e1546ed27f62663dbe5c4b" }
 steam-vent-proto = "0.5"
 tokio = { version = "1", features = ["sync"] }
 regex = "1"

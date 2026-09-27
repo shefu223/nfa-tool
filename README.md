@@ -2,6 +2,8 @@
 
 Windows loader for switching between Steam accounts using login tokens. Built for shefu223.shop, works with any valid Steam login token.
 
+![NFA Loader](assets/screenshot.png)
+
 Paste a token, press Add, and the loader writes the account into Steam's config so you can sign in with one click. Account checks (token valid or invalid, CS2 Premier and Wingman rank, cooldown, avatar, and with an optional Steam Web API key VAC status and level) run locally on the machine. No proxies, no external checker service.
 
 ## Build
