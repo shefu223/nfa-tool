@@ -12,12 +12,12 @@
       {
         "label": "main",
         "title": "shefu223 NFA Loader",
-        "width": 460,
-        "height": 824,
-        "minWidth": 460,
-        "minHeight": 824,
-        "resizable": false,
-        "maximizable": false,
+        "width": 900,
+        "height": 740,
+        "minWidth": 640,
+        "minHeight": 560,
+        "resizable": true,
+        "maximizable": true,
         "decorations": false,
         "transparent": true,
         "center": true,
@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self'"
+      "csp": "default-src 'self'; img-src 'self' data: https://avatars.steamstatic.com https://*.steamstatic.com https://*.akamaihd.net; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self'"
     }
   },
   "bundle": {

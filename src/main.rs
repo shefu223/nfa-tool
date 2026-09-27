@@ -1,18 +1,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod steam_check;
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use steam_check::ServerListCell;
 use tauri::State;
+use tokio::sync::Semaphore;
 use winreg::RegKey;
 
 const WARRANTY_API_URL: &str = "https://shefu223.shop/api/warranty";
-const CHECK_API_URL: &str = "https://shefu223.shop/token-checker/api/check";
 const APP_VERSION: &str = "1";
 const VERSION_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/shefu223/nfa-tool/main/latest.json";
@@ -37,6 +41,7 @@ struct AccountView {
     added_at: u64,
     no_warranty: bool,
     warranty_expiry: Option<u64>,
+    token_expiry: Option<u64>,
 }
 
 impl From<&Account> for AccountView {
@@ -47,15 +52,65 @@ impl From<&Account> for AccountView {
             added_at: a.added_at,
             no_warranty: a.no_warranty,
             warranty_expiry: a.warranty_expiry,
+            token_expiry: jwt_expiry(&a.token),
         }
     }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Settings {
+    #[serde(default)]
+    api_key: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Snapshot {
+    steamid: String,
+    #[serde(default)]
+    token_state: Option<String>,
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
+    avatar: Option<String>,
+    #[serde(default)]
+    profile_state: i32,
+    #[serde(default)]
+    private: bool,
+    #[serde(default)]
+    in_game: Option<String>,
+    #[serde(default)]
+    premier_rating: Option<i64>,
+    #[serde(default)]
+    premier_wins: Option<i64>,
+    #[serde(default)]
+    wingman_rank: Option<i64>,
+    #[serde(default)]
+    cooldown_expires: Option<i64>,
+    #[serde(default)]
+    vac: Option<bool>,
+    #[serde(default)]
+    vac_count: Option<u32>,
+    #[serde(default)]
+    game_bans: Option<u32>,
+    #[serde(default)]
+    level: Option<u32>,
+    #[serde(default)]
+    inv_value: Option<f64>,
+    #[serde(default)]
+    public_checked_at: Option<u64>,
+    #[serde(default)]
+    deep_checked_at: Option<u64>,
+    #[serde(default)]
+    inv_checked_at: Option<u64>,
 }
 
 #[derive(Serialize)]
 struct Bootstrap {
     accounts: Vec<AccountView>,
+    snapshots: Vec<Snapshot>,
     active_user: Option<String>,
     elevated: bool,
+    has_api_key: bool,
 }
 
 #[derive(Serialize)]
@@ -86,19 +141,12 @@ struct VersionInfo {
     update_available: bool,
 }
 
-#[derive(Deserialize, Serialize, Clone, Default)]
-struct CheckResponse {
-    prime: Option<bool>,
-    vac_clean: Option<bool>,
-    cooldown: Option<bool>,
-    level: Option<u32>,
-    inv_value: Option<String>,
-    medals: Option<u32>,
-    premier_rating: Option<u32>,
-}
-
 struct AppData {
     accounts: Mutex<Vec<Account>>,
+    settings: Mutex<Settings>,
+    snapshots: Mutex<HashMap<String, Snapshot>>,
+    server_list: ServerListCell,
+    deep_gate: Semaphore,
 }
 
 fn unix_now() -> u64 {
@@ -108,7 +156,15 @@ fn unix_now() -> u64 {
 #[tauri::command]
 fn bootstrap(state: State<AppData>) -> Bootstrap {
     let accounts = state.accounts.lock().unwrap().iter().map(AccountView::from).collect();
-    Bootstrap { accounts, active_user: read_autologin_user(), elevated: is_elevated() }
+    let snapshots = state.snapshots.lock().unwrap().values().cloned().collect();
+    let has_api_key = !state.settings.lock().unwrap().api_key.trim().is_empty();
+    Bootstrap {
+        accounts,
+        snapshots,
+        active_user: read_autologin_user(),
+        elevated: is_elevated(),
+        has_api_key,
+    }
 }
 
 #[tauri::command]
@@ -212,16 +268,145 @@ async fn warranty(steamid: String, state: State<'_, AppData>) -> Result<Option<W
 }
 
 #[tauri::command]
-async fn check(steamid: String, state: State<'_, AppData>) -> Result<CheckResponse, String> {
-    let cred = {
+fn view_token(steamid: String, state: State<AppData>) -> Result<String, String> {
+    let accounts = state.accounts.lock().unwrap();
+    accounts
+        .iter()
+        .find(|a| a.steamid == steamid)
+        .map(|a| format!("{}----{}", a.username, a.token))
+        .ok_or_else(|| "Account not found.".into())
+}
+
+#[tauri::command]
+fn set_api_key(key: String, state: State<AppData>) -> Result<bool, String> {
+    let mut s = state.settings.lock().unwrap();
+    s.api_key = key.trim().to_string();
+    save_settings(&s);
+    Ok(!s.api_key.is_empty())
+}
+
+#[tauri::command]
+async fn public_check(steamid: String, state: State<'_, AppData>) -> Result<Snapshot, String> {
+    let (sid_u64, api_key) = {
         let accounts = state.accounts.lock().unwrap();
-        accounts.iter().find(|a| a.steamid == steamid).map(|a| format!("{}----{}", a.username, a.token))
-    }
-    .ok_or("Account not found.")?;
-    let data = tauri::async_runtime::spawn_blocking(move || fetch_check_data(&cred))
+        let acc = accounts
+            .iter()
+            .find(|a| a.steamid == steamid)
+            .ok_or("Account not found.")?;
+        let sid: u64 = acc.steamid.parse().map_err(|_| "Bad SteamID.".to_string())?;
+        (sid, state.settings.lock().unwrap().api_key.clone())
+    };
+
+    let profile = tauri::async_runtime::spawn_blocking(move || steam_check::fetch_profile(sid_u64))
         .await
         .map_err(|e| e.to_string())?;
-    data.ok_or_else(|| "Check failed, token may be dead or the service is unavailable.".to_string())
+    let level = if api_key.is_empty() {
+        None
+    } else {
+        let k = api_key.clone();
+        tauri::async_runtime::spawn_blocking(move || steam_check::fetch_level(&k, sid_u64))
+            .await
+            .ok()
+            .flatten()
+    };
+    let ban = if api_key.is_empty() {
+        None
+    } else {
+        let k = api_key.clone();
+        let sid_str = steamid.clone();
+        tauri::async_runtime::spawn_blocking(move || steam_check::fetch_bans(&k, &[sid_str]))
+            .await
+            .ok()
+            .and_then(|m| m.into_values().next())
+    };
+
+    let got_profile = profile.is_some();
+    let mut snaps = state.snapshots.lock().unwrap();
+    let snap = snaps.entry(steamid.clone()).or_default();
+    snap.steamid = steamid.clone();
+    if let Some(p) = profile {
+        snap.persona = p.persona;
+        snap.avatar = p.avatar;
+        snap.profile_state = p.state;
+        snap.private = p.private;
+        snap.in_game = p.in_game;
+    }
+    if let Some(l) = level {
+        snap.level = Some(l);
+    }
+    if let Some(b) = ban {
+        snap.vac = Some(b.vac);
+        snap.vac_count = Some(b.vac_count);
+        snap.game_bans = Some(b.game_bans);
+    }
+    if got_profile {
+        snap.public_checked_at = Some(unix_now());
+    }
+    let out = snap.clone();
+    save_snapshots(&snaps);
+    Ok(out)
+}
+
+#[tauri::command]
+async fn deep_check(steamid: String, state: State<'_, AppData>) -> Result<Snapshot, String> {
+    let (username, token) = {
+        let accounts = state.accounts.lock().unwrap();
+        let acc = accounts
+            .iter()
+            .find(|a| a.steamid == steamid)
+            .ok_or("Account not found.")?;
+        (acc.username.clone(), acc.token.clone())
+    };
+
+    let _permit = state
+        .deep_gate
+        .acquire()
+        .await
+        .map_err(|_| "Busy, try again in a moment.".to_string())?;
+    let server_list = steam_check::server_list(&state.server_list)
+        .await
+        .ok_or("Can't check right now. Check your internet and try again.")?;
+    let outcome = steam_check::deep_check(server_list, &username, &token).await;
+
+    let mut snaps = state.snapshots.lock().unwrap();
+    let snap = snaps.entry(steamid.clone()).or_default();
+    snap.steamid = steamid.clone();
+    snap.token_state = Some(
+        match outcome.liveness {
+            steam_check::Liveness::Valid => "valid",
+            steam_check::Liveness::Invalid => "invalid",
+            steam_check::Liveness::Unknown => "unknown",
+        }
+        .to_string(),
+    );
+    if let Some(d) = outcome.data {
+        snap.premier_rating = d.premier_rating.or(snap.premier_rating);
+        snap.premier_wins = d.premier_wins.or(snap.premier_wins);
+        snap.wingman_rank = d.wingman_rank.or(snap.wingman_rank);
+        snap.cooldown_expires = d.cooldown_expires;
+    }
+    snap.deep_checked_at = Some(unix_now());
+    let out = snap.clone();
+    save_snapshots(&snaps);
+    Ok(out)
+}
+
+#[tauri::command]
+async fn inventory_value(steamid: String, state: State<'_, AppData>) -> Result<f64, String> {
+    let sid_u64: u64 = steamid.parse().map_err(|_| "Bad SteamID.".to_string())?;
+    let val =
+        tauri::async_runtime::spawn_blocking(move || steam_check::fetch_inventory_value(sid_u64))
+            .await
+            .map_err(|e| e.to_string())?;
+    let val = val
+        .ok_or("Can't check the inventory right now. It may be private, or try again later.")?;
+    let mut snaps = state.snapshots.lock().unwrap();
+    let snap = snaps.entry(steamid.clone()).or_default();
+    snap.steamid = steamid.clone();
+    snap.inv_value = Some(val);
+    snap.inv_checked_at = Some(unix_now());
+    save_snapshots(&snaps);
+    Ok(val)
 }
 
 #[tauri::command]
@@ -231,6 +416,9 @@ async fn version_info() -> Option<VersionInfo> {
 
 #[tauri::command]
 fn open_url(url: String) {
+    if !url.starts_with("https://") {
+        return;
+    }
     let target = HSTRING::from(url);
     unsafe {
         ShellExecuteW(
@@ -249,7 +437,13 @@ fn main() {
         return;
     }
     tauri::Builder::default()
-        .manage(AppData { accounts: Mutex::new(load_accounts()) })
+        .manage(AppData {
+            accounts: Mutex::new(load_accounts()),
+            settings: Mutex::new(load_settings()),
+            snapshots: Mutex::new(load_snapshots()),
+            server_list: ServerListCell::new(),
+            deep_gate: Semaphore::new(1),
+        })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             add_account,
@@ -262,7 +456,11 @@ fn main() {
             logout,
             clear_steam,
             warranty,
-            check,
+            view_token,
+            set_api_key,
+            public_check,
+            deep_check,
+            inventory_value,
             version_info,
             open_url
         ])
@@ -284,22 +482,6 @@ fn fetch_warranty(license_key: &str) -> Option<WarrantyResponse> {
         return None;
     }
     resp.json::<WarrantyResponse>().ok()
-}
-
-fn fetch_check_data(token_line: &str) -> Option<CheckResponse> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .build()
-        .ok()?;
-    let resp = client
-        .post(CHECK_API_URL)
-        .json(&serde_json::json!({ "token": token_line }))
-        .send()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    resp.json::<CheckResponse>().ok()
 }
 
 fn fetch_version_info() -> Option<VersionInfo> {
@@ -324,9 +506,18 @@ fn fetch_version_info() -> Option<VersionInfo> {
     })
 }
 
-fn accounts_path() -> PathBuf {
+fn nfa_dir() -> PathBuf {
     let base = std::env::var("APPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-    base.join("shefu223-nfa").join("accounts.json")
+    base.join("shefu223-nfa")
+}
+fn accounts_path() -> PathBuf {
+    nfa_dir().join("accounts.json")
+}
+fn settings_path() -> PathBuf {
+    nfa_dir().join("settings.json")
+}
+fn snapshots_path() -> PathBuf {
+    nfa_dir().join("snapshots.json")
 }
 fn load_accounts() -> Vec<Account> {
     let Ok(text) = fs::read_to_string(accounts_path()) else {
@@ -343,6 +534,47 @@ fn save_accounts(accounts: &[Account]) {
         let _ = fs::write(&path, text);
     }
 }
+fn load_settings() -> Settings {
+    fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+fn save_settings(settings: &Settings) {
+    let path = settings_path();
+    if let Some(p) = path.parent() {
+        let _ = fs::create_dir_all(p);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(settings) {
+        let _ = fs::write(&path, text);
+    }
+}
+fn load_snapshots() -> HashMap<String, Snapshot> {
+    fs::read_to_string(snapshots_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+fn save_snapshots(snapshots: &HashMap<String, Snapshot>) {
+    let path = snapshots_path();
+    if let Some(p) = path.parent() {
+        let _ = fs::create_dir_all(p);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(snapshots) {
+        let _ = fs::write(&path, text);
+    }
+}
+fn jwt_expiry(token: &str) -> Option<u64> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    json.get("exp").and_then(|v| v.as_u64())
+}
 fn build_account(line: &str) -> Result<Account, String> {
     let (username, token) = parse_credential(line)?;
     let steamid = extract_steamid_from_jwt(&token)?;
@@ -358,7 +590,9 @@ fn login_account(acc: &Account) -> Result<String, String> {
     update_loginusers_vdf(&config_dir.join("loginusers.vdf"), &acc.username, &acc.steamid)?;
     write_local_vdf(&acc.username, &acc.token)?;
     write_localconfig_vdf(&steam_path, &acc.steamid)?;
+    disable_user_chooser(&config_dir.join("config.vdf"));
     write_autologin_user(&acc.username)?;
+    write_remember_password();
     launch_steam(&steam_path);
     Ok(format!("Logged in as '{}'. Steam is starting.", acc.username))
 }
@@ -460,26 +694,89 @@ fn update_existing_user(content: &str, username: &str, steamid: &str) -> Result<
         result.push_str(line);
         result.push('\n');
         if line.contains(&format!("\"{}\"", steamid)) {
+            let mut seen_allow = false;
+            let mut seen_remember = false;
+            let mut seen_offline = false;
+            let mut seen_skip = false;
+            let mut seen_most = false;
+            let mut seen_ts = false;
             for inner in lines.by_ref() {
+                if inner.trim() == "}" {
+                    if !seen_most {
+                        result.push_str("\t\t\t\"MostRecent\"\t\t\"1\"\n");
+                    }
+                    if !seen_allow {
+                        result.push_str("\t\t\t\"AllowAutoLogin\"\t\t\"1\"\n");
+                    }
+                    if !seen_remember {
+                        result.push_str("\t\t\t\"RememberPassword\"\t\t\"1\"\n");
+                    }
+                    if !seen_offline {
+                        result.push_str("\t\t\t\"WantsOfflineMode\"\t\t\"0\"\n");
+                    }
+                    if !seen_skip {
+                        result.push_str("\t\t\t\"SkipOfflineModeWarning\"\t\t\"0\"\n");
+                    }
+                    if !seen_ts {
+                        result.push_str(&format!(
+                            "\t\t\t\"Timestamp\"\t\t\"{}\"\n",
+                            current_timestamp()
+                        ));
+                    }
+                    result.push_str(inner);
+                    result.push('\n');
+                    break;
+                }
                 if inner.contains("\"AccountName\"") {
                     result.push_str(&format!("\t\t\t\"AccountName\"\t\t\"{}\"\n", username));
                 } else if inner.contains("\"PersonaName\"") {
                     result.push_str(&format!("\t\t\t\"PersonaName\"\t\t\"{}\"\n", username));
                 } else if inner.contains("\"MostRecent\"") {
+                    seen_most = true;
                     result.push_str("\t\t\t\"MostRecent\"\t\t\"1\"\n");
+                } else if inner.contains("\"AllowAutoLogin\"") {
+                    seen_allow = true;
+                    result.push_str("\t\t\t\"AllowAutoLogin\"\t\t\"1\"\n");
+                } else if inner.contains("\"RememberPassword\"") {
+                    seen_remember = true;
+                    result.push_str("\t\t\t\"RememberPassword\"\t\t\"1\"\n");
+                } else if inner.contains("\"WantsOfflineMode\"") {
+                    seen_offline = true;
+                    result.push_str("\t\t\t\"WantsOfflineMode\"\t\t\"0\"\n");
+                } else if inner.contains("\"SkipOfflineModeWarning\"") {
+                    seen_skip = true;
+                    result.push_str("\t\t\t\"SkipOfflineModeWarning\"\t\t\"0\"\n");
                 } else if inner.contains("\"Timestamp\"") {
-                    result.push_str(&format!("\t\t\t\"Timestamp\"\t\t\"{}\"\n", current_timestamp()));
+                    seen_ts = true;
+                    result.push_str(&format!(
+                        "\t\t\t\"Timestamp\"\t\t\"{}\"\n",
+                        current_timestamp()
+                    ));
                 } else {
                     result.push_str(inner);
                     result.push('\n');
-                }
-                if inner.trim() == "}" {
-                    break;
                 }
             }
         }
     }
     Ok(result)
+}
+
+fn disable_user_chooser(config_path: &Path) {
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return;
+    };
+    if !content.contains("AlwaysShowUserChooser") {
+        return;
+    }
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r#"("AlwaysShowUserChooser"\s+)"[^"]*""#).unwrap()
+    });
+    let new_content = re.replace_all(&content, r#"${1}"0""#);
+    if new_content != content {
+        let _ = fs::write(config_path, new_content.as_ref());
+    }
 }
 fn insert_new_user(content: &str, username: &str, steamid: &str) -> Result<String, String> {
     let block = format!(
@@ -675,14 +972,41 @@ fn write_autologin_user(name: &str) -> Result<(), String> {
 fn clear_autologin_user() -> Result<(), String> {
     write_autologin_user("")
 }
-fn kill_steam_process() -> Result<(), String> {
-    let output = Command::new("taskkill").args(["/F", "/IM", "steam.exe", "/T"]).output();
-    let killed = matches!(output, Ok(o) if o.status.success());
-    let _ = Command::new("taskkill").args(["/F", "/IM", "steamwebhelper.exe", "/T"]).output();
-    if killed {
-        std::thread::sleep(Duration::from_millis(1200));
+fn write_remember_password() {
+    let hkcu = RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    if let Ok(key) =
+        hkcu.open_subkey_with_flags("SOFTWARE\\Valve\\Steam", winreg::enums::KEY_SET_VALUE)
+    {
+        let _ = key.set_value("RememberPassword", &1u32);
     }
+}
+fn kill_steam_process() -> Result<(), String> {
+    for proc in [
+        "steam.exe",
+        "steamwebhelper.exe",
+        "steamservice.exe",
+        "steamerrorreporter.exe",
+        "streaming_client.exe",
+    ] {
+        let _ = Command::new("taskkill").args(["/F", "/IM", proc, "/T"]).output();
+    }
+    for _ in 0..30 {
+        if !steam_is_running() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_millis(400));
     Ok(())
+}
+fn steam_is_running() -> bool {
+    let Ok(out) = Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq steam.exe", "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).to_lowercase().contains("steam.exe")
 }
 fn delete_steam_files_and_folder(config_dir: &Path, steam_base: &Path) -> Result<(), String> {
     for name in &["config.vdf", "loginusers.vdf"] {

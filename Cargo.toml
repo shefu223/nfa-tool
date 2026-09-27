@@ -18,6 +18,12 @@ winreg = "0.55"
 base64 = "0.22"
 crc32fast = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+# Local, non-destructive Steam checks (token validity + CS2 rank scrape). No proxies, no shop API.
+steam-vent = "0.5"
+steam-vent-proto = "0.5"
+tokio = { version = "1", features = ["sync"] }
+regex = "1"
+urlencoding = "2"
 
 [dependencies.windows]
 version = "0.58"

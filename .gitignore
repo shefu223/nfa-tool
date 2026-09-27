@@ -1,5 +1,5 @@
 /target
-/gen/schemas
+/gen
 nfa.exe
 *.pdb
 Thumbs.db
